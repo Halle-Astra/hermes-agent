@@ -82,6 +82,91 @@ def _ra():
     return run_agent
 
 
+# ── Premature-stop continuation guard ────────────────────────────
+# Heuristic patterns that suggest the model promised to act but
+# returned no tool calls.  Checked only when continuation_guard
+# is enabled.  Keep both CJK and Latin patterns — users report the
+# issue most frequently with Chinese-speaking models.
+
+_CONTINUATION_ACTION_PATTERNS = re.compile(
+    r"(?:"
+    # English action-promising patterns
+    r"(?:I(?:'|'|')?(?:ll|m going to|m about to|will now|will try|shall))\s"
+    r"|(?:Let me (?:now |try |go ahead |start |begin |run |execute |check |test ))"
+    r"|(?:(?:Starting|Executing|Running|Proceeding|Beginning|Attempting)\b.*\.\.\.)"
+    r"|(?:\((?:开始|正在|即将|马上).*(?:执行|运行|测试|检查|操作).*\))"
+    # Chinese action-promising patterns
+    r"|(?:我(?:将|来|要|会|现在|先|尝试|试试|马上|立即|接下来))"
+    r"|(?:(?:开始|正在|即将|马上|立即|首先|接下来)(?:执行|运行|测试|检查|操作|尝试|探测))"
+    r"|(?:\U0001f680\s*(?:立即|开始|马上))"
+    r")",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+_CONTINUATION_FINAL_ANSWER_PATTERNS = re.compile(
+    r"(?:"
+    # Signals that the response IS a final answer, not a stalled preamble
+    r"(?:In (?:summary|conclusion)|To summarize|Here(?:'|'|')?s (?:the|a|my) (?:summary|result|answer|solution))"
+    r"|(?:The (?:answer|result|solution|output|issue|problem|fix) (?:is|was|looks))"
+    r"|(?:(?:总结|综上|结论|答案|结果|解决方案|修复方案)(?:如下|是|为))"
+    r"|(?:Done[.!]|Finished[.!]|Complete[.!]|已完成|搞定|完成了)"
+    r"|(?:(?:Unfortunately|I (?:can(?:'|'|')?t|cannot|don(?:'|'|')?t|am unable))\b)"
+    r"|(?:(?:抱歉|很遗憾|无法|不能|做不到))"
+    r")",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _looks_like_premature_stop(response_text: str, has_tools: bool) -> bool:
+    """Return True if the response looks like an action preamble without
+    follow-through.  Only meaningful when the model has tools available
+    but chose not to call any.
+    """
+    if not response_text or not has_tools:
+        return False
+    stripped = response_text.strip()
+    if not stripped:
+        return False
+    if len(stripped) > 1500:
+        return False
+    if _CONTINUATION_FINAL_ANSWER_PATTERNS.search(stripped):
+        return False
+    if _CONTINUATION_ACTION_PATTERNS.search(stripped):
+        return True
+    return False
+
+
+def _llm_judges_premature_stop(agent, response_text: str) -> bool:
+    """Use a lightweight LLM call to judge whether the response is a
+    premature stop.  Returns True if the LLM thinks the model was about
+    to act but stopped.  Falls back to the heuristic on any error.
+    """
+    try:
+        from agent.auxiliary_client import call_llm
+        prompt = (
+            "You are a quality-control judge. The following is the COMPLETE "
+            "output from an AI coding agent for this turn. The agent has "
+            "tools available (terminal, file editing, search, etc.) but "
+            "returned ONLY this text with NO tool calls.\n\n"
+            "---BEGIN AGENT OUTPUT---\n"
+            f"{response_text[:800]}\n"
+            "---END AGENT OUTPUT---\n\n"
+            "Question: Does this output indicate the agent intended to "
+            "perform actions (run commands, edit files, etc.) but stopped "
+            "prematurely without actually doing them?\n"
+            "Answer with EXACTLY one word: YES or NO."
+        )
+        result = call_llm(
+            prompt,
+            task="continuation_guard",
+            max_tokens=5,
+        )
+        return result.strip().upper().startswith("YES")
+    except Exception as exc:
+        logger.debug("continuation_guard LLM check failed: %s", exc)
+        return _looks_like_premature_stop(response_text, True)
+
+
 def _restore_or_build_system_prompt(agent, system_message, conversation_history):
     """Restore the cached system prompt from the session DB or build it fresh.
 
@@ -284,6 +369,7 @@ def run_conversation(
     agent._last_content_tools_all_housekeeping = False
     agent._mute_post_response = False
     agent._unicode_sanitization_passes = 0
+    agent._continuation_guard_retries = 0
     agent._tool_guardrails.reset_for_turn()
     agent._tool_guardrail_halt_decision = None
     # True until the server rejects an image_url content part with an error
@@ -3717,6 +3803,64 @@ def run_conversation(
 
                 codex_ack_continuations = 0
 
+                # ── Premature-stop continuation guard ─────────────
+                # Detect responses that promise action ("I'll now run…")
+                # but contain no tool calls.  Nudge the model to
+                # actually execute instead of accepting a stalled
+                # preamble as the final answer.  Capped at 3 retries
+                # per turn.  See agent.continuation_guard in config.
+                if (
+                    agent._continuation_guard
+                    and agent._continuation_guard_retries < 3
+                    and agent.valid_tool_names
+                ):
+                    _stripped_resp = agent._strip_think_blocks(
+                        final_response or ""
+                    ).strip()
+                    _is_premature = False
+                    if agent._continuation_guard == "llm":
+                        _is_premature = _llm_judges_premature_stop(
+                            agent, _stripped_resp
+                        )
+                    else:
+                        _is_premature = _looks_like_premature_stop(
+                            _stripped_resp, bool(agent.valid_tool_names)
+                        )
+
+                    if _is_premature:
+                        agent._continuation_guard_retries += 1
+                        logger.info(
+                            "Continuation guard triggered (%d/3): "
+                            "response looks like a stalled preamble "
+                            "(mode=%s, len=%d)",
+                            agent._continuation_guard_retries,
+                            agent._continuation_guard,
+                            len(_stripped_resp),
+                        )
+                        agent._emit_status(
+                            f"⚠️ Model stopped after announcing actions — "
+                            f"nudging to continue "
+                            f"({agent._continuation_guard_retries}/3)"
+                        )
+                        interim_msg = agent._build_assistant_message(
+                            assistant_message, "incomplete"
+                        )
+                        messages.append(interim_msg)
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "[System: You just described what you were "
+                                "about to do but did not actually execute "
+                                "any tool calls. Please proceed and use "
+                                "your tools to carry out the actions you "
+                                "described. Do not just narrate — act.]"
+                            ),
+                            "_continuation_guard_synthetic": True,
+                        })
+                        agent._session_messages = messages
+                        agent._save_session_log(messages)
+                        continue
+
                 if truncated_response_parts:
                     final_response = "".join(truncated_response_parts) + final_response
                     truncated_response_parts = []
@@ -3737,6 +3881,7 @@ def run_conversation(
                         messages[-1].get("_thinking_prefill")
                         or messages[-1].get("_empty_recovery_synthetic")
                         or messages[-1].get("_empty_terminal_sentinel")
+                        or messages[-1].get("_continuation_guard_synthetic")
                     )
                 ):
                     messages.pop()

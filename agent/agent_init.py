@@ -1079,6 +1079,15 @@ def init_agent(
         _agent_section = {}
     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
+    # Premature-stop continuation guard.  See config.py for docs.
+    _cg_raw = _agent_section.get("continuation_guard", False)
+    if isinstance(_cg_raw, str) and _cg_raw.lower() in ("true", "1", "yes"):
+        _cg_raw = True
+    elif isinstance(_cg_raw, str) and _cg_raw.lower() in ("false", "0", "no", ""):
+        _cg_raw = False
+    agent._continuation_guard = _cg_raw  # False | True | "llm"
+    agent._continuation_guard_retries = 0  # reset per turn in conversation_loop
+
     # App-level API retry count (wraps each model API call).  Default 3,
     # overridable via agent.api_max_retries in config.yaml.  See #11616.
     try:

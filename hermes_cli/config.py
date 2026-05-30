@@ -586,6 +586,18 @@ DEFAULT_CONFIG = {
         # only controls how inbound user images are presented.
         "image_input_mode": "auto",
         "disabled_toolsets": [],
+        # Premature-stop continuation guard.  When the model returns a
+        # text-only response (no tool calls) that looks like it was
+        # promising to take action but stopped, inject a nudge and
+        # continue the loop so the model actually executes.  Useful
+        # for weaker LLMs that emit preambles like "I'll now run X..."
+        # but never call the tool.
+        #   false  — disabled (default)
+        #   true   — enable heuristic-based detection
+        #   "llm"  — use a lightweight LLM self-check (costs one
+        #            extra API call per candidate stop; most accurate)
+        # Max retries per turn capped at 3 to prevent infinite loops.
+        "continuation_guard": False,
     },
     
     "terminal": {
