@@ -87,20 +87,61 @@ def _ra():
 # returned no tool calls.  Checked only when continuation_guard
 # is enabled.  Keep both CJK and Latin patterns — users report the
 # issue most frequently with Chinese-speaking models.
+#
+# Design principle: the most reliable signal for a stalled preamble
+# is HOW THE RESPONSE ENDS, not what the body contains.  A genuine
+# final answer may mention "I'll" mid-text but concludes properly.
+# A premature stop characteristically ENDS with an unfinished
+# action promise — often in parenthetical markers like
+# "(开始执行...)" or "(Starting execution...)".
 
+# ── Tail-end patterns (high confidence) ──────────────────────────
+# These match against the LAST ~200 chars of the response.
+# Parenthetical action markers and trailing action ellipses.
+_CONTINUATION_TAIL_PATTERNS = re.compile(
+    r"(?:"
+    # Parenthetical action markers (CN + EN)
+    r"\((?:开始|正在|即将|马上|准备|继续)"
+    r"(?:[\u4e00-\u9fff\w\s]*)"
+    r"(?:\.\.\.|\u2026)?\s*\)"
+    r"|(?:\((?:Starting|Executing|Running|Preparing|Beginning|Proceeding)"
+    r"[^)]*(?:\.\.\.|\u2026)?\s*\))"
+    # Bare trailing action ellipses (no parentheses)
+    r"|(?:(?:开始|正在|准备|即将|继续)[\u4e00-\u9fff\w]*(?:\.\.\.|\u2026)\s*$)"
+    r"|(?:(?:I(?:'|'|')?(?:ll|m going to|m about to|will now|will try)"
+    r"|Let me (?:now |try |start |begin |run |execute ))[^.]*"
+    r"(?:\.\.\.|\u2026)\s*$)"
+    r")",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# ── Body-level action patterns (medium confidence) ───────────────
+# Only checked for shorter responses (<1500 chars) where the whole
+# text is essentially a preamble.
 _CONTINUATION_ACTION_PATTERNS = re.compile(
     r"(?:"
     # English action-promising patterns
     r"(?:I(?:'|'|')?(?:ll|m going to|m about to|will now|will try|shall))\s"
     r"|(?:Let me (?:now |try |go ahead |start |begin |run |execute |check |test ))"
     r"|(?:(?:Starting|Executing|Running|Proceeding|Beginning|Attempting)\b.*\.\.\.)"
-    r"|(?:\((?:开始|正在|即将|马上).*(?:执行|运行|测试|检查|操作).*\))"
     # Chinese action-promising patterns
     r"|(?:我(?:将|来|要|会|现在|先|尝试|试试|马上|立即|接下来))"
     r"|(?:(?:开始|正在|即将|马上|立即|首先|接下来)(?:执行|运行|测试|检查|操作|尝试|探测))"
     r"|(?:\U0001f680\s*(?:立即|开始|马上))"
     r")",
     re.IGNORECASE | re.MULTILINE,
+)
+
+# ── Section header patterns indicating upcoming action ───────────
+# Multi-section responses that end with a "next steps" / "action
+# plan" section followed by a trailing action marker.
+_CONTINUATION_PLAN_SECTION_PATTERNS = re.compile(
+    r"(?:"
+    r"(?:下一步|接下来|行动计划|立即行动|即将|下一个行动)"
+    r"|(?:Next\s*(?:Step|Action)|Action\s*Plan|TODO|Immediately)"
+    r"|(?:🚀|🛠️|⚡)\s*(?:立即|开始|下一步|Next|Start|Action|Begin)"
+    r")",
+    re.IGNORECASE,
 )
 
 _CONTINUATION_FINAL_ANSWER_PATTERNS = re.compile(
@@ -121,12 +162,42 @@ def _looks_like_premature_stop(response_text: str, has_tools: bool) -> bool:
     """Return True if the response looks like an action preamble without
     follow-through.  Only meaningful when the model has tools available
     but chose not to call any.
+
+    Two-tier check:
+      1. Tail check (any length): does the response END with an action
+         promise?  This catches long reflective texts that conclude with
+         "(开始重写核心驱动...)" or "(Preparing to execute...)".
+      2. Body check (short responses only, <1500 chars): does the body
+         contain action-promising language?  This catches short preambles
+         like "I'll now run the screenshot command."
+
+    Final-answer patterns are only checked for body-level matches,
+    because a tail-end parenthetical action marker is an unambiguous
+    stop signal regardless of what the body says.
     """
     if not response_text or not has_tools:
         return False
     stripped = response_text.strip()
     if not stripped:
         return False
+
+    # Tier 1: Tail check — examine the last ~300 chars.
+    # High confidence: a trailing action marker is almost always a stall.
+    tail = stripped[-300:]
+    if _CONTINUATION_TAIL_PATTERNS.search(tail):
+        return True
+
+    # Tier 1b: Plan-section + tail action marker combo.
+    # The response has a "next steps" section header AND the tail
+    # contains action language — this is a planning-then-stalling
+    # pattern seen in long reflective responses.
+    if len(stripped) > 500:
+        last_quarter = stripped[-(len(stripped) // 4):]
+        if (_CONTINUATION_PLAN_SECTION_PATTERNS.search(last_quarter)
+                and _CONTINUATION_ACTION_PATTERNS.search(last_quarter)):
+            return True
+
+    # Tier 2: Body check — only for short responses.
     if len(stripped) > 1500:
         return False
     if _CONTINUATION_FINAL_ANSWER_PATTERNS.search(stripped):
@@ -138,33 +209,116 @@ def _looks_like_premature_stop(response_text: str, has_tools: bool) -> bool:
 
 def _llm_judges_premature_stop(agent, response_text: str) -> bool:
     """Use a lightweight LLM call to judge whether the response is a
-    premature stop.  Returns True if the LLM thinks the model was about
-    to act but stopped.  Falls back to the heuristic on any error.
+    premature stop.  Uses JSON-structured output for robustness with
+    weaker models that struggle with bare YES/NO instruction following.
+
+    For models that ignore JSON instructions entirely (e.g. gemma-4),
+    the parser also scans the model's reasoning text for verdict
+    keywords.  Falls back to heuristic on any error.
     """
     try:
-        from agent.auxiliary_client import call_llm
+        from agent.auxiliary_client import call_llm, extract_content_or_reasoning
+
+        tail_text = response_text.strip()[-600:] if len(response_text) > 600 else response_text.strip()
+
         prompt = (
-            "You are a quality-control judge. The following is the COMPLETE "
-            "output from an AI coding agent for this turn. The agent has "
-            "tools available (terminal, file editing, search, etc.) but "
-            "returned ONLY this text with NO tool calls.\n\n"
-            "---BEGIN AGENT OUTPUT---\n"
-            f"{response_text[:800]}\n"
-            "---END AGENT OUTPUT---\n\n"
-            "Question: Does this output indicate the agent intended to "
-            "perform actions (run commands, edit files, etc.) but stopped "
-            "prematurely without actually doing them?\n"
-            "Answer with EXACTLY one word: YES or NO."
+            'An AI coding agent just returned the following text as its '
+            'COMPLETE output for this turn.  The agent has tools (terminal, '
+            'file editor, search, etc.) but used NONE of them — it only '
+            'produced this text.\n\n'
+            '---AGENT OUTPUT (tail)---\n'
+            f'{tail_text}\n'
+            '---END---\n\n'
+            'Does the output end by announcing an action the agent is about '
+            'to take (e.g. "Starting execution...", "(开始重写...)", '
+            '"I\'ll now run X", "准备编写...") WITHOUT actually doing it?\n\n'
+            'Respond with ONLY a JSON object, nothing else:\n'
+            '{"stalled": true}  — if the agent announced actions but stopped\n'
+            '{"stalled": false} — if this is a genuine completed response\n'
         )
-        result = call_llm(
-            prompt,
+        response = call_llm(
             task="continuation_guard",
-            max_tokens=5,
+            max_tokens=100,
+            messages=[{"role": "user", "content": prompt}],
         )
-        return result.strip().upper().startswith("YES")
+        raw = extract_content_or_reasoning(response)
+        return _parse_llm_stall_judgment(raw)
     except Exception as exc:
         logger.debug("continuation_guard LLM check failed: %s", exc)
         return _looks_like_premature_stop(response_text, True)
+
+
+def _parse_llm_stall_judgment(raw: str) -> bool:
+    """Parse the LLM's stall judgment from its raw output.
+
+    Tries multiple extraction strategies in order of reliability:
+      1. JSON parse (ideal case)
+      2. Regex extraction of "stalled": true/false
+      3. Keyword scan for stalled/true/yes/false/no
+      4. Reasoning-text analysis — for models (gemma-4, etc.) that
+         ignore JSON instructions and write analytical prose instead.
+         Scans for verdict-indicating phrases in the analysis.
+    """
+    if not raw:
+        return False
+    text = raw.strip()
+
+    # Strategy 1: direct JSON parse
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict) and "stalled" in obj:
+            return bool(obj["stalled"])
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Strategy 2: extract JSON fragment from surrounding text
+    json_match = re.search(r'\{[^}]*"stalled"\s*:\s*(true|false)[^}]*\}', text, re.IGNORECASE)
+    if json_match:
+        return json_match.group(1).lower() == "true"
+
+    # Strategy 3: look for the bare value after "stalled"
+    bare_match = re.search(r'"?stalled"?\s*[:=]\s*(true|false|yes|no)', text, re.IGNORECASE)
+    if bare_match:
+        return bare_match.group(1).lower() in ("true", "yes")
+
+    # Strategy 4: reasoning-text analysis for verbose models.
+    # These models write things like "The agent announces an action
+    # but didn't execute it, so this IS stalled" or "This is a
+    # completed response" instead of JSON.
+    text_lower = text.lower()
+
+    # Positive indicators (model thinks it's stalled)
+    stall_indicators = [
+        "stalled", "did not actually", "didn't actually",
+        "without actually doing", "without executing",
+        "announced actions but stopped", "announces an action",
+        "premature", "incomplete",
+        # Chinese
+        "停转", "未执行", "没有执行", "宣布了行动但停止",
+    ]
+    # Negative indicators (model thinks it's completed)
+    done_indicators = [
+        "genuine completed", "completed response", "not stalled",
+        "is a genuine", "genuine final",
+        "completed", "summariz", "conclusion",
+        # Chinese
+        "已完成", "真正完成", "不是停转",
+    ]
+
+    stall_score = sum(1 for ind in stall_indicators if ind in text_lower)
+    done_score = sum(1 for ind in done_indicators if ind in text_lower)
+
+    if stall_score > 0 and stall_score > done_score:
+        return True
+    if done_score > 0 and done_score > stall_score:
+        return False
+
+    # Strategy 5: last resort — scan for YES/TRUE anywhere
+    upper = text.upper()
+    if "TRUE" in upper or "YES" in upper:
+        if "FALSE" not in upper and "NO" not in upper:
+            return True
+    return False
 
 
 def _restore_or_build_system_prompt(agent, system_message, conversation_history):
@@ -3819,9 +3973,13 @@ def run_conversation(
                     ).strip()
                     _is_premature = False
                     if agent._continuation_guard == "llm":
-                        _is_premature = _llm_judges_premature_stop(
-                            agent, _stripped_resp
+                        _is_premature = _looks_like_premature_stop(
+                            _stripped_resp, bool(agent.valid_tool_names)
                         )
+                        if not _is_premature:
+                            _is_premature = _llm_judges_premature_stop(
+                                agent, _stripped_resp
+                            )
                     else:
                         _is_premature = _looks_like_premature_stop(
                             _stripped_resp, bool(agent.valid_tool_names)
