@@ -170,23 +170,16 @@ def _looks_like_premature_stop(response_text: str, has_tools: bool) -> bool:
     follow-through.  Only meaningful when the model has tools available
     but chose not to call any.
 
-    IMPORTANT: the caller must ensure this is only invoked when the
-    model has NOT yet called any tools during this turn.  Once the
-    model has done real work (executed tool calls), a text-only
-    response is a legitimate conclusion and this function should
-    not be called.
+    Runs at every turn-end.  Only uses high-confidence tail-end
+    patterns to avoid false positives on legitimate conclusions.
+    Body-level matching (Tier 2) was removed because it triggered
+    on normal post-tool summaries that contain action-like language
+    ("I'll analyze...", "我来检查...").
 
-    Two-tier check:
-      1. Tail check (any length): does the response END with an action
-         promise?  This catches long reflective texts that conclude with
-         "(开始重写核心驱动...)" or "(Preparing to execute...)".
-      2. Body check (short responses only, <800 chars): does the body
-         contain action-promising language?  This catches short preambles
-         like "I'll now run the screenshot command."
-
-    Final-answer patterns are only checked for body-level matches,
-    because a tail-end parenthetical action marker is an unambiguous
-    stop signal regardless of what the body says.
+    Tier 1: Tail check — does the response END with an explicit
+      action marker like "(开始执行...)" or "(Starting...)"?
+    Tier 1b: Plan-section combo — does the last quarter contain
+      a "next steps" header AND action language?
     """
     if not response_text or not has_tools:
         return False
@@ -195,28 +188,17 @@ def _looks_like_premature_stop(response_text: str, has_tools: bool) -> bool:
         return False
 
     # Tier 1: Tail check — examine the last ~300 chars.
-    # High confidence: a trailing action marker is almost always a stall.
     tail = stripped[-300:]
     if _CONTINUATION_TAIL_PATTERNS.search(tail):
         return True
 
     # Tier 1b: Plan-section + tail action marker combo.
-    # The response has a "next steps" section header AND the tail
-    # contains action language — this is a planning-then-stalling
-    # pattern seen in long reflective responses.
     if len(stripped) > 500:
         last_quarter = stripped[-(len(stripped) // 4):]
         if (_CONTINUATION_PLAN_SECTION_PATTERNS.search(last_quarter)
                 and _CONTINUATION_ACTION_PATTERNS.search(last_quarter)):
             return True
 
-    # Tier 2: Body check — only for SHORT responses.
-    if len(stripped) > 800:
-        return False
-    if _CONTINUATION_FINAL_ANSWER_PATTERNS.search(stripped):
-        return False
-    if _CONTINUATION_ACTION_PATTERNS.search(stripped):
-        return True
     return False
 
 
@@ -3977,23 +3959,13 @@ def run_conversation(
                 # preamble as the final answer.  Capped at 3 retries
                 # per turn.  See agent.continuation_guard in config.
                 #
-                # KEY GUARD: only check when the model has NOT yet
-                # called any tools in this turn.  Once the model has
-                # done real work (tool calls executed), a text-only
-                # response is a legitimate conclusion, not a stall.
-                # Without this, every post-tool summary triggers the
-                # guard because it naturally contains action language.
-                _model_used_tools_this_turn = any(
-                    isinstance(m, dict)
-                    and m.get("role") == "assistant"
-                    and m.get("tool_calls")
-                    for m in messages[current_turn_user_idx:]
-                )
+                # Runs at every turn-end (text response without tool
+                # calls).  The model may have called tools earlier in
+                # this turn and still stall on the final text response.
                 if (
                     agent._continuation_guard
                     and agent._continuation_guard_retries < 3
                     and agent.valid_tool_names
-                    and not _model_used_tools_this_turn
                 ):
                     _stripped_resp = agent._strip_think_blocks(
                         final_response or ""
