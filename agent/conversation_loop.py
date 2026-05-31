@@ -165,20 +165,24 @@ _CONTINUATION_FINAL_ANSWER_PATTERNS = re.compile(
 )
 
 
-def _looks_like_premature_stop(response_text: str, has_tools: bool,
-                               prev_was_tool: bool = False) -> bool:
+def _looks_like_premature_stop(response_text: str, has_tools: bool) -> bool:
     """Return True if the response looks like an action preamble without
     follow-through.  Only meaningful when the model has tools available
     but chose not to call any.
+
+    IMPORTANT: the caller must ensure this is only invoked when the
+    model has NOT yet called any tools during this turn.  Once the
+    model has done real work (executed tool calls), a text-only
+    response is a legitimate conclusion and this function should
+    not be called.
 
     Two-tier check:
       1. Tail check (any length): does the response END with an action
          promise?  This catches long reflective texts that conclude with
          "(开始重写核心驱动...)" or "(Preparing to execute...)".
-      2. Body check (short responses only, <800 chars, NOT after tool
-         results): does the body contain action-promising language?
-         Skipped when prev_was_tool=True because post-tool responses
-         naturally contain action-like phrases ("我来分析结果").
+      2. Body check (short responses only, <800 chars): does the body
+         contain action-promising language?  This catches short preambles
+         like "I'll now run the screenshot command."
 
     Final-answer patterns are only checked for body-level matches,
     because a tail-end parenthetical action marker is an unambiguous
@@ -206,13 +210,7 @@ def _looks_like_premature_stop(response_text: str, has_tools: bool,
                 and _CONTINUATION_ACTION_PATTERNS.search(last_quarter)):
             return True
 
-    # Tier 2: Body check — only for SHORT responses that are NOT
-    # following tool results.  Post-tool responses naturally contain
-    # action-like language ("我来分析", "Let me check") as part of
-    # legitimate analysis flow, so we skip body-level matching to
-    # avoid false positives.
-    if prev_was_tool:
-        return False
+    # Tier 2: Body check — only for SHORT responses.
     if len(stripped) > 800:
         return False
     if _CONTINUATION_FINAL_ANSWER_PATTERNS.search(stripped):
@@ -3978,23 +3976,32 @@ def run_conversation(
                 # actually execute instead of accepting a stalled
                 # preamble as the final answer.  Capped at 3 retries
                 # per turn.  See agent.continuation_guard in config.
+                #
+                # KEY GUARD: only check when the model has NOT yet
+                # called any tools in this turn.  Once the model has
+                # done real work (tool calls executed), a text-only
+                # response is a legitimate conclusion, not a stall.
+                # Without this, every post-tool summary triggers the
+                # guard because it naturally contains action language.
+                _model_used_tools_this_turn = any(
+                    isinstance(m, dict)
+                    and m.get("role") == "assistant"
+                    and m.get("tool_calls")
+                    for m in messages[current_turn_user_idx:]
+                )
                 if (
                     agent._continuation_guard
                     and agent._continuation_guard_retries < 3
                     and agent.valid_tool_names
+                    and not _model_used_tools_this_turn
                 ):
                     _stripped_resp = agent._strip_think_blocks(
                         final_response or ""
                     ).strip()
-                    _prev_was_tool = any(
-                        m.get("role") == "tool"
-                        for m in messages[-5:]
-                    )
                     _is_premature = False
                     if agent._continuation_guard == "llm":
                         _is_premature = _looks_like_premature_stop(
                             _stripped_resp, bool(agent.valid_tool_names),
-                            prev_was_tool=_prev_was_tool,
                         )
                         if not _is_premature:
                             _is_premature = _llm_judges_premature_stop(
@@ -4003,7 +4010,6 @@ def run_conversation(
                     else:
                         _is_premature = _looks_like_premature_stop(
                             _stripped_resp, bool(agent.valid_tool_names),
-                            prev_was_tool=_prev_was_tool,
                         )
 
                     if _is_premature:
