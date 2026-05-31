@@ -152,6 +152,53 @@ See `hermes claw migrate --help` for all options, or use the `openclaw-migration
 
 ---
 
+## Custom Configuration Options
+
+These options were added to improve Hermes's behavior with weaker or local LLMs. Add them to `~/.hermes/config.yaml`.
+
+### Continuation Guard (`agent.continuation_guard`)
+
+When using less capable models, the agent sometimes outputs text like "I'll now execute the command..." but never actually calls any tools — it just stops. The continuation guard detects this and nudges the model to follow through.
+
+```yaml
+agent:
+  continuation_guard: true    # Heuristic mode (zero extra API calls)
+  # continuation_guard: "llm" # Heuristic + LLM fallback (more accurate, costs one extra API call)
+  # continuation_guard: false # Disabled (default)
+```
+
+**How it works:** At each turn-end, the guard checks the model's response. A response is considered "stalled" only when it is **purely forward-looking** (e.g. "I will now run X", "接下来我要执行Y") with **no completed work reported anywhere** in the text. Progress reports like "I've finished X, next I'll do Y" are never flagged. Max 3 nudges per turn to prevent loops.
+
+### Tool Preview Length (`display.tool_preview_length`)
+
+By default, gateway platforms (Feishu, Telegram, Discord, etc.) truncate tool commands to 40 characters:
+
+```
+💻 terminal: "export DISPLAY=:0 && export XAUTHORIT..."
+```
+
+To see full, untruncated commands, set `tool_preview_length` to `0`:
+
+```yaml
+display:
+  tool_preview_length: 0   # Show full commands (0 = no limit)
+  # tool_preview_length: 40  # Default for gateway platforms
+  # tool_preview_length: 80  # Custom limit
+```
+
+You can also override per-platform:
+
+```yaml
+display:
+  platforms:
+    feishu:
+      tool_preview_length: 0     # Full commands on Feishu only
+    telegram:
+      tool_preview_length: 80    # Longer previews on Telegram
+```
+
+---
+
 ## Contributing
 
 We welcome contributions! See the [Contributing Guide](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing) for development setup, code style, and PR process.
