@@ -83,103 +83,90 @@ def _ra():
 
 
 # ── Premature-stop continuation guard ────────────────────────────
-# Heuristic patterns that suggest the model promised to act but
-# returned no tool calls.  Checked only when continuation_guard
-# is enabled.  Keep both CJK and Latin patterns — users report the
-# issue most frequently with Chinese-speaking models.
+# Design: check the LAST SENTENCE of the response.  A stalled
+# preamble ends with forward-looking action language ("我将执行",
+# "I'll now run").  A legitimate conclusion ends with past-tense
+# or present-tense summary ("已完成", "Done", "The issue is...").
 #
-# Design principle: the most reliable signal for a stalled preamble
-# is HOW THE RESPONSE ENDS, not what the body contains.  A genuine
-# final answer may mention "I'll" mid-text but concludes properly.
-# A premature stop characteristically ENDS with an unfinished
-# action promise — often in parenthetical markers like
-# "(开始执行...)" or "(Starting execution...)".
+# We extract the last non-empty line(s) and check for:
+#   1. Forward-looking action verbs → stall signal
+#   2. Completion/summary language → NOT a stall
+#
+# This is format-agnostic: no dependency on ellipsis, parentheses,
+# or any other surface marker.
 
-# ── Tail-end patterns (high confidence) ──────────────────────────
-# These match against the LAST ~200 chars of the response.
-# Parenthetical action markers and trailing action ellipses.
-_CONTINUATION_TAIL_PATTERNS = re.compile(
-    r"(?:"
-    # Parenthetical action markers (CN + EN)
-    r"\((?:开始|正在|即将|马上|准备|继续)"
-    r"(?:[\u4e00-\u9fff\w\s]*)"
-    r"(?:\.\.\.|\u2026)?\s*\)"
-    r"|(?:\((?:Starting|Executing|Running|Preparing|Beginning|Proceeding)"
-    r"[^)]*(?:\.\.\.|\u2026)?\s*\))"
-    # Bare trailing action ellipses (no parentheses)
-    r"|(?:(?:开始|正在|准备|即将|继续)[\u4e00-\u9fff\w]*(?:\.\.\.|\u2026)\s*$)"
-    r"|(?:(?:I(?:'|'|')?(?:ll|m going to|m about to|will now|will try)"
-    r"|Let me (?:now |try |start |begin |run |execute ))[^.]*"
-    r"(?:\.\.\.|\u2026)\s*$)"
-    r")",
-    re.IGNORECASE | re.MULTILINE,
-)
+def _extract_last_sentences(text: str, n: int = 3) -> str:
+    """Return the last N non-empty lines of text, joined."""
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    return "\n".join(lines[-n:]) if lines else ""
 
-# ── Body-level action patterns (medium confidence) ───────────────
-# Only checked for SHORT responses (<800 chars) where the whole
-# text is essentially a preamble, AND when the previous message
-# is NOT a tool result (post-tool responses often contain
-# conversational action language like "我来分析" that would
-# false-positive).  These patterns must be more specific than
-# everyday conversational Chinese/English.
-_CONTINUATION_ACTION_PATTERNS = re.compile(
-    r"(?:"
-    # English action-promising patterns
-    r"(?:I(?:'|'|')?(?:ll|m going to|m about to|will now|will try|shall))\s"
-    r"|(?:Let me (?:now |try |go ahead |start |begin |run |execute |check |test ))"
-    r"|(?:(?:Starting|Executing|Running|Proceeding|Beginning|Attempting)\b.*\.\.\.)"
-    # Chinese action-promising patterns — TIGHTENED.
-    # Only match when followed by concrete action verbs (执行/运行/测试/etc),
-    # not standalone "我来" / "我要" which are normal conversational phrases.
-    r"|(?:我(?:将|马上|立即|现在就|这就)(?:执行|运行|测试|检查|操作|尝试|编写|重写|修改|创建|实现))"
-    r"|(?:我(?:来|要|会|先|尝试|试试|接下来)(?:执行|运行|测试|检查|操作|尝试|编写|重写|修改|创建|实现))"
-    r"|(?:(?:开始|正在|即将|马上|立即|首先|接下来)(?:执行|运行|测试|检查|操作|尝试|探测|编写|重写))"
-    r"|(?:\U0001f680\s*(?:立即|开始|马上))"
-    r")",
-    re.IGNORECASE | re.MULTILINE,
-)
 
-# ── Section header patterns indicating upcoming action ───────────
-# Multi-section responses that end with a "next steps" / "action
-# plan" section followed by a trailing action marker.
-_CONTINUATION_PLAN_SECTION_PATTERNS = re.compile(
+# Forward-looking action patterns — matched against LAST sentences only.
+_FORWARD_ACTION_PATTERNS = re.compile(
     r"(?:"
-    r"(?:下一步|接下来|行动计划|立即行动|即将|下一个行动)"
-    r"|(?:Next\s*(?:Step|Action)|Action\s*Plan|TODO|Immediately)"
-    r"|(?:🚀|🛠️|⚡)\s*(?:立即|开始|下一步|Next|Start|Action|Begin)"
+    # ── Chinese forward-looking ──
+    # "我将/我来/我要/我会/我先/我马上/我立即/我现在/我接下来" + verb-ish
+    r"我(?:将|来|要|会|先|马上|立即|现在就?|这就|接下来|尝试|试试)"
+    r"(?:[\u4e00-\u9fff]+)"
+    # "开始/正在/即将/准备/继续" + action
+    r"|(?:开始|正在|即将|准备|继续)(?:[\u4e00-\u9fff]+)"
+    # "接下来" as sentence starter
+    r"|接下来(?:我)?(?:[\u4e00-\u9fff]*)"
+    # ── English forward-looking ──
+    r"|(?:I(?:'|'|')?(?:ll|m going to|m about to|will now|will try|shall))\s"
+    r"|(?:Let me (?:now |try |go ahead |start|begin |run |execute |check |test ))"
+    r"|(?:(?:Starting|Executing|Running|Proceeding|Beginning|Attempting|Preparing)\b)"
+    r"|(?:Next[,:]?\s+I(?:'|'|')?(?:ll| will| need to| am going to)\b)"
     r")",
     re.IGNORECASE,
 )
 
-_CONTINUATION_FINAL_ANSWER_PATTERNS = re.compile(
+# Completion/summary patterns — if the last sentences match these,
+# it's a genuine conclusion, NOT a stall.
+_COMPLETION_PATTERNS = re.compile(
     r"(?:"
-    # Signals that the response IS a final answer, not a stalled preamble
-    r"(?:In (?:summary|conclusion)|To summarize|Here(?:'|'|')?s (?:the|a|my) (?:summary|result|answer|solution))"
-    r"|(?:The (?:answer|result|solution|output|issue|problem|fix) (?:is|was|looks))"
-    r"|(?:(?:总结|综上|结论|答案|结果|解决方案|修复方案)(?:如下|是|为))"
-    r"|(?:Done[.!]|Finished[.!]|Complete[.!]|已完成|搞定|完成了)"
+    # ── Chinese completion ──
+    r"(?:已(?:经|完成|解决|修复|处理|实现|成功))"
+    r"|(?:完成了|搞定|解决了|修复了|处理了)"
+    r"|(?:(?:总结|综上|结论|以上|结果)(?:如下|是|为|：|:)?)"
+    r"|(?:问题(?:出在|在于|是))"
+    r"|(?:(?:抱歉|很遗憾|无法|不能|做不到|不支持))"
+    # ── English completion ──
+    r"|(?:Done[.!]?|Finished[.!]?|Complete[d.]?)"
+    r"|(?:I(?:'|'|')?ve (?:completed|finished|fixed|updated|resolved|implemented))"
+    r"|(?:(?:In (?:summary|conclusion)|To summarize))"
+    r"|(?:The (?:issue|problem|error|bug|fix|solution|result|answer) (?:is|was))"
     r"|(?:(?:Unfortunately|I (?:can(?:'|'|')?t|cannot|don(?:'|'|')?t|am unable))\b)"
-    r"|(?:(?:抱歉|很遗憾|无法|不能|做不到))"
+    r"|(?:Here(?:'|'|')?s (?:the|a|my|what))"
+    r"|(?:(?:Everything|It|This) (?:is|looks|works|seems) )"
     r")",
-    re.IGNORECASE | re.MULTILINE,
+    re.IGNORECASE,
+)
+
+# Plan/action section headers in the LAST portion of the response.
+_PLAN_SECTION_PATTERNS = re.compile(
+    r"(?:"
+    r"(?:下一步|接下来|行动计划|立即行动|下一个行动|即将)"
+    r"|(?:Next\s*(?:Step|Action)|Action\s*Plan|TODO|Immediately)"
+    r"|(?:(?:\U0001f680|\U0001f6e0\ufe0f|\u26a1)\s*(?:立即|开始|下一步|Next|Start|Action|Begin))"
+    r")",
+    re.IGNORECASE,
 )
 
 
 def _looks_like_premature_stop(response_text: str, has_tools: bool) -> bool:
-    """Return True if the response looks like an action preamble without
-    follow-through.  Only meaningful when the model has tools available
-    but chose not to call any.
+    """Return True if the response ends with a forward-looking action
+    promise — the model said what it WILL do but didn't actually do it.
 
-    Runs at every turn-end.  Only uses high-confidence tail-end
-    patterns to avoid false positives on legitimate conclusions.
-    Body-level matching (Tier 2) was removed because it triggered
-    on normal post-tool summaries that contain action-like language
-    ("I'll analyze...", "我来检查...").
+    Runs at every turn-end.  Format-agnostic: does not depend on
+    ellipsis, parentheses, or any surface markers.
 
-    Tier 1: Tail check — does the response END with an explicit
-      action marker like "(开始执行...)" or "(Starting...)"?
-    Tier 1b: Plan-section combo — does the last quarter contain
-      a "next steps" header AND action language?
+    Logic:
+      1. Extract last 3 non-empty lines.
+      2. If they contain completion language → not a stall.
+      3. If they contain forward-looking action language → stall.
+      4. For longer responses: if the last quarter has a plan-section
+         header + action language → stall.
     """
     if not response_text or not has_tools:
         return False
@@ -187,16 +174,28 @@ def _looks_like_premature_stop(response_text: str, has_tools: bool) -> bool:
     if not stripped:
         return False
 
-    # Tier 1: Tail check — examine the last ~300 chars.
-    tail = stripped[-300:]
-    if _CONTINUATION_TAIL_PATTERNS.search(tail):
+    last_sentences = _extract_last_sentences(stripped)
+    if not last_sentences:
+        return False
+
+    # Check only the LAST LINE for completion vs forward-action.
+    # Earlier lines may contain completion language ("Analysis complete.")
+    # while the final line is a forward-looking promise.
+    last_line = _extract_last_sentences(stripped, 1)
+
+    # If the last line itself contains completion language, it's done.
+    if _COMPLETION_PATTERNS.search(last_line):
+        return False
+
+    # If the last line contains forward-looking action, it's a stall.
+    if _FORWARD_ACTION_PATTERNS.search(last_line):
         return True
 
-    # Tier 1b: Plan-section + tail action marker combo.
+    # For longer responses: plan-section header + action in last quarter.
     if len(stripped) > 500:
         last_quarter = stripped[-(len(stripped) // 4):]
-        if (_CONTINUATION_PLAN_SECTION_PATTERNS.search(last_quarter)
-                and _CONTINUATION_ACTION_PATTERNS.search(last_quarter)):
+        if (_PLAN_SECTION_PATTERNS.search(last_quarter)
+                and _FORWARD_ACTION_PATTERNS.search(last_quarter)):
             return True
 
     return False
