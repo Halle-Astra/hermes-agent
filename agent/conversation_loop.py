@@ -174,17 +174,15 @@ def _looks_like_premature_stop(response_text: str, has_tools: bool) -> bool:
     if not stripped:
         return False
 
-    last_sentences = _extract_last_sentences(stripped)
-    if not last_sentences:
+    # KEY CHECK: if the response contains completion language ANYWHERE,
+    # it's a progress report ("I completed X, next I'll do Y"), not a
+    # stall.  True stalls are PURELY forward-looking with no completed
+    # work reported.
+    if _COMPLETION_PATTERNS.search(stripped):
         return False
 
-    # Check only the LAST LINE for completion vs forward-action.
-    # Earlier lines may contain completion language ("Analysis complete.")
-    # while the final line is a forward-looking promise.
     last_line = _extract_last_sentences(stripped, 1)
-
-    # If the last line itself contains completion language, it's done.
-    if _COMPLETION_PATTERNS.search(last_line):
+    if not last_line:
         return False
 
     # If the last line contains forward-looking action, it's a stall.
