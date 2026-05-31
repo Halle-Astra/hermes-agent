@@ -116,17 +116,24 @@ _CONTINUATION_TAIL_PATTERNS = re.compile(
 )
 
 # ── Body-level action patterns (medium confidence) ───────────────
-# Only checked for shorter responses (<1500 chars) where the whole
-# text is essentially a preamble.
+# Only checked for SHORT responses (<800 chars) where the whole
+# text is essentially a preamble, AND when the previous message
+# is NOT a tool result (post-tool responses often contain
+# conversational action language like "我来分析" that would
+# false-positive).  These patterns must be more specific than
+# everyday conversational Chinese/English.
 _CONTINUATION_ACTION_PATTERNS = re.compile(
     r"(?:"
     # English action-promising patterns
     r"(?:I(?:'|'|')?(?:ll|m going to|m about to|will now|will try|shall))\s"
     r"|(?:Let me (?:now |try |go ahead |start |begin |run |execute |check |test ))"
     r"|(?:(?:Starting|Executing|Running|Proceeding|Beginning|Attempting)\b.*\.\.\.)"
-    # Chinese action-promising patterns
-    r"|(?:我(?:将|来|要|会|现在|先|尝试|试试|马上|立即|接下来))"
-    r"|(?:(?:开始|正在|即将|马上|立即|首先|接下来)(?:执行|运行|测试|检查|操作|尝试|探测))"
+    # Chinese action-promising patterns — TIGHTENED.
+    # Only match when followed by concrete action verbs (执行/运行/测试/etc),
+    # not standalone "我来" / "我要" which are normal conversational phrases.
+    r"|(?:我(?:将|马上|立即|现在就|这就)(?:执行|运行|测试|检查|操作|尝试|编写|重写|修改|创建|实现))"
+    r"|(?:我(?:来|要|会|先|尝试|试试|接下来)(?:执行|运行|测试|检查|操作|尝试|编写|重写|修改|创建|实现))"
+    r"|(?:(?:开始|正在|即将|马上|立即|首先|接下来)(?:执行|运行|测试|检查|操作|尝试|探测|编写|重写))"
     r"|(?:\U0001f680\s*(?:立即|开始|马上))"
     r")",
     re.IGNORECASE | re.MULTILINE,
@@ -158,7 +165,8 @@ _CONTINUATION_FINAL_ANSWER_PATTERNS = re.compile(
 )
 
 
-def _looks_like_premature_stop(response_text: str, has_tools: bool) -> bool:
+def _looks_like_premature_stop(response_text: str, has_tools: bool,
+                               prev_was_tool: bool = False) -> bool:
     """Return True if the response looks like an action preamble without
     follow-through.  Only meaningful when the model has tools available
     but chose not to call any.
@@ -167,9 +175,10 @@ def _looks_like_premature_stop(response_text: str, has_tools: bool) -> bool:
       1. Tail check (any length): does the response END with an action
          promise?  This catches long reflective texts that conclude with
          "(开始重写核心驱动...)" or "(Preparing to execute...)".
-      2. Body check (short responses only, <1500 chars): does the body
-         contain action-promising language?  This catches short preambles
-         like "I'll now run the screenshot command."
+      2. Body check (short responses only, <800 chars, NOT after tool
+         results): does the body contain action-promising language?
+         Skipped when prev_was_tool=True because post-tool responses
+         naturally contain action-like phrases ("我来分析结果").
 
     Final-answer patterns are only checked for body-level matches,
     because a tail-end parenthetical action marker is an unambiguous
@@ -197,8 +206,14 @@ def _looks_like_premature_stop(response_text: str, has_tools: bool) -> bool:
                 and _CONTINUATION_ACTION_PATTERNS.search(last_quarter)):
             return True
 
-    # Tier 2: Body check — only for short responses.
-    if len(stripped) > 1500:
+    # Tier 2: Body check — only for SHORT responses that are NOT
+    # following tool results.  Post-tool responses naturally contain
+    # action-like language ("我来分析", "Let me check") as part of
+    # legitimate analysis flow, so we skip body-level matching to
+    # avoid false positives.
+    if prev_was_tool:
+        return False
+    if len(stripped) > 800:
         return False
     if _CONTINUATION_FINAL_ANSWER_PATTERNS.search(stripped):
         return False
@@ -3971,10 +3986,15 @@ def run_conversation(
                     _stripped_resp = agent._strip_think_blocks(
                         final_response or ""
                     ).strip()
+                    _prev_was_tool = any(
+                        m.get("role") == "tool"
+                        for m in messages[-5:]
+                    )
                     _is_premature = False
                     if agent._continuation_guard == "llm":
                         _is_premature = _looks_like_premature_stop(
-                            _stripped_resp, bool(agent.valid_tool_names)
+                            _stripped_resp, bool(agent.valid_tool_names),
+                            prev_was_tool=_prev_was_tool,
                         )
                         if not _is_premature:
                             _is_premature = _llm_judges_premature_stop(
@@ -3982,7 +4002,8 @@ def run_conversation(
                             )
                     else:
                         _is_premature = _looks_like_premature_stop(
-                            _stripped_resp, bool(agent.valid_tool_names)
+                            _stripped_resp, bool(agent.valid_tool_names),
+                            prev_was_tool=_prev_was_tool,
                         )
 
                     if _is_premature:
